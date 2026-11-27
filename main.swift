@@ -258,7 +258,7 @@ func count(_ n: Int) -> String {
 
 // MARK: - Widget view
 
-final class Model: ObservableObject { @Published var stats = Stats(); @Published var loading = true }
+final class Model: ObservableObject { @Published var stats = Stats(); @Published var loading = true; @Published var mini = false; @Published var collapsed = false; var toggleCollapsed: () -> Void = {}; var close: () -> Void = {} }
 
 struct Row: View {
     let label: String; let tokens: Int; var cost: Double? = nil
@@ -273,19 +273,91 @@ struct Row: View {
     }
 }
 
-struct WidgetView: View {
+struct CollapseButton: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        Button(action: model.toggleCollapsed) {
+            Image(systemName: model.mini ? (model.collapsed ? "chevron.right" : "chevron.left") : (model.collapsed ? "chevron.down" : "chevron.up"))
+                .font(.system(size: 10, weight: .semibold)).foregroundColor(.secondary)
+                .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(model.collapsed ? "Expand" : "Collapse")
+    }
+}
+
+/// Hides the widget; the app stays in the menu bar, where Show / Hide Widget brings it back
+struct CloseButton: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        Button(action: model.close) {
+            Image(systemName: "xmark")
+                .font(.system(size: 10, weight: .semibold)).foregroundColor(.secondary)
+                .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Close widget (reopen from the 🔥 menu)")
+    }
+}
+
+/// Small pill for the floating option: this month's cost and today's.
+struct MiniView: View {
     @ObservedObject var model: Model
     var body: some View {
         let s = model.stats
-        let peak = max(s.daily.max() ?? 0, 0.000001)
+        HStack(spacing: 6) {
+            if !model.collapsed { Text("🔥") }
+            Text(model.loading ? "…" : money(s.cycle.cost)).font(.system(size: 15, weight: .bold, design: .rounded).monospacedDigit())
+            if !model.loading && !model.collapsed {
+                Text("today \(money(s.today.cost))").font(.system(size: 11).monospacedDigit()).foregroundColor(.secondary)
+            }
+            CollapseButton(model: model)
+            CloseButton(model: model)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(Capsule().fill(Color(NSColor.windowBackgroundColor).opacity(0.94)))
+        .fixedSize()
+    }
+}
+
+struct WidgetView: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        if model.mini { MiniView(model: model) } else { full }
+    }
+
+    @ViewBuilder private var full: some View {
+        let s = model.stats
         let day = Date.FormatStyle().day().month(.abbreviated)
         let last = Calendar.current.date(byAdding: .day, value: -1, to: s.end)!
         VStack(alignment: .leading, spacing: 6) {
-            Text("🔥 Billing month · \(s.start.formatted(day)) – \(last.formatted(day))").font(.system(size: 12, weight: .semibold))
+            HStack(spacing: 0) {
+                Text("🔥 Billing month · \(s.start.formatted(day)) – \(last.formatted(day))").font(.system(size: 12, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                Spacer(minLength: 4)
+                CollapseButton(model: model)
+                CloseButton(model: model)
+            }
             if model.loading {
                 Text("Reading logs…").foregroundColor(.secondary)
             } else {
                 Text(money(s.cycle.cost)).font(.system(size: 34, weight: .bold, design: .rounded).monospacedDigit())
+                if !model.collapsed { details }
+            }
+        }
+        .padding(14)
+        .frame(width: 270, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 18).fill(Color(NSColor.windowBackgroundColor).opacity(0.94)))
+        .fixedSize()
+    }
+
+    /// Everything under the amount; hidden when collapsed
+    @ViewBuilder private var details: some View {
+        let s = model.stats
+        let peak = max(s.daily.max() ?? 0, 0.000001)
+        let day = Date.FormatStyle().day().month(.abbreviated)
+        let last = Calendar.current.date(byAdding: .day, value: -1, to: s.end)!
                 Group {
                     Text("\(count(s.cycle.usage.total)) tokens · day \(s.elapsedDays) of \(s.daily.count)")
                     Text("On pace for \(money(s.projected)) by renewal")
@@ -327,12 +399,6 @@ struct WidgetView: View {
                 }
                 Text("Claude Code only · estimate at API list price · \(s.updated.formatted(date: .omitted, time: .standard))")
                     .font(.system(size: 8)).foregroundColor(.secondary)
-            }
-        }
-        .padding(14)
-        .frame(width: 270)
-        .background(RoundedRectangle(cornerRadius: 18).fill(Color(NSColor.windowBackgroundColor).opacity(0.94)))
-        .fixedSize()
     }
 }
 
@@ -346,6 +412,9 @@ final class App: NSObject, NSApplicationDelegate {
     var panel: NSPanel!
     var host: NSHostingView<WidgetView>!
     var onTopItem: NSMenuItem!
+    var miniItem: NSMenuItem!
+    /// Each size remembers its own position
+    var positionKey: String { model.mini ? "miniTopLeft" : "topLeft" }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -354,6 +423,9 @@ final class App: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Show / Hide Widget", action: #selector(toggle), keyEquivalent: "w").target = self
         onTopItem = menu.addItem(withTitle: "Keep on Top", action: #selector(toggleOnTop), keyEquivalent: "t")
         onTopItem.target = self
+        miniItem = menu.addItem(withTitle: "Floating Mini Widget", action: #selector(toggleMini), keyEquivalent: "m")
+        miniItem.target = self
+        model.mini = UserDefaults.standard.bool(forKey: "mini")
         menu.addItem(.separator())
         addPicker(menu, "Billing Day", key: "billingDay", current: Plan.day,
                   choices: (1...31).map { ("\($0)", $0) })
@@ -367,21 +439,21 @@ final class App: NSObject, NSApplicationDelegate {
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         host = NSHostingView(rootView: WidgetView(model: model))
         panel.contentView = host
+        model.collapsed = UserDefaults.standard.bool(forKey: "collapsed")
+        model.close = { [weak self] in self?.panel.orderOut(nil) }
+        model.toggleCollapsed = { [weak self] in self?.toggleCollapsed() }
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         applyLevel()
-        let screen = NSScreen.main?.visibleFrame ?? .zero
-        let saved = UserDefaults.standard.string(forKey: "topLeft").map(NSPointFromString)
-        let visible = saved.map { p in NSScreen.screens.contains { $0.frame.contains(NSPoint(x: p.x + 20, y: p.y - 20)) } } ?? false
-        resize(topLeft: visible ? saved! : NSPoint(x: screen.maxX - 290, y: screen.maxY - 20))
+        place()
         panel.orderFrontRegardless()
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self] _ in
             guard let f = self?.panel.frame else { return }
-            UserDefaults.standard.set(NSStringFromPoint(NSPoint(x: f.minX, y: f.maxY)), forKey: "topLeft")
+            UserDefaults.standard.set(NSStringFromPoint(NSPoint(x: f.minX, y: f.maxY)), forKey: self!.positionKey)
         }
 
         refresh()
@@ -430,9 +502,37 @@ final class App: NSObject, NSApplicationDelegate {
         if frame != panel.frame { panel.setFrame(frame, display: true) }
     }
 
+    /// Moves the panel to where this size was last left, else the top right of the screen.
+    func place() {
+        let screen = NSScreen.main?.visibleFrame ?? .zero
+        let saved = UserDefaults.standard.string(forKey: positionKey).map(NSPointFromString)
+        let visible = saved.map { p in NSScreen.screens.contains { $0.frame.contains(NSPoint(x: p.x + 20, y: p.y - 10)) } } ?? false
+        resize(topLeft: visible ? saved! : NSPoint(x: screen.maxX - host.fittingSize.width - 20, y: screen.maxY - 20))
+    }
+
+    /// The chevron button: collapse or expand the card or pill
+    func toggleCollapsed() {
+        model.collapsed.toggle()
+        UserDefaults.standard.set(model.collapsed, forKey: "collapsed")
+        DispatchQueue.main.async { self.resize(topLeft: NSPoint(x: self.panel.frame.minX, y: self.panel.frame.maxY)) }
+    }
+
+    @objc func toggleMini() {
+        model.mini.toggle()
+        UserDefaults.standard.set(model.mini, forKey: "mini")
+        applyLevel()
+        // let SwiftUI lay out the new size before measuring it
+        DispatchQueue.main.async {
+            self.place()
+            self.panel.orderFrontRegardless()
+        }
+    }
+
     /// Off: sits on the desktop behind other windows, like a widget. On: floats above them.
     func applyLevel() {
-        let top = UserDefaults.standard.bool(forKey: "onTop")
+        let top = model.mini || UserDefaults.standard.bool(forKey: "onTop")  // the mini widget always floats
+        miniItem.state = model.mini ? .on : .off
+        onTopItem.action = model.mini ? nil : #selector(toggleOnTop)  // greyed out while mini
         panel.level = top ? .floating : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
         onTopItem.state = top ? .on : .off
     }
@@ -453,6 +553,8 @@ if args.contains("--once") || args.contains("--snapshot") {
     if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
         _ = NSApplication.shared
         let model = Model(); model.stats = s; model.loading = false
+        model.mini = args.contains("--mini")
+        model.collapsed = args.contains("--collapsed")
         let view = NSHostingView(rootView: WidgetView(model: model))
         view.frame = NSRect(origin: .zero, size: view.fittingSize)
         view.layoutSubtreeIfNeeded()
